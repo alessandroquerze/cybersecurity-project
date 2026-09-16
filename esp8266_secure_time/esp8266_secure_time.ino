@@ -1,25 +1,6 @@
 /*
-  ESP8266 secure time sender
-  Protocol:
-    - TCP socket is considered untrusted.
-    - Ephemeral ECDH P-256 provides a fresh shared secret.
-    - A pre-shared key (PSK) authenticates the ECDH handshake with HMAC-SHA256.
-    - HKDF-SHA256 derives independent AES-256-GCM keys for each direction.
-    - AES-GCM protects confidentiality + integrity.
-    - A monotonically increasing counter is authenticated and used in the IV.
-    - The ESP sends TIME|HH:MM:SS every X seconds.
-    - The PC can send INC|n, DEC|n, SET|n, GET.
 
-  Arduino libraries:
-    1) ESP8266 board package
-    2) micro-ecc by Kenneth MacKay: https://github.com/kmackay/micro-ecc
-    3) Arduino Cryptography Library by Rhys Weatherley / CryptoArduino fork:
-       https://github.com/gmag11/CryptoArduino
-
-  IMPORTANT:
-    - Use the same 32-byte PSK on ESP and PC.
-    - Change WIFI_SSID, WIFI_PASSWORD, SERVER_IP.
-    - This demo assumes no attacker can extract the PSK from ESP flash.
+micro-ecc by Kenneth MacKay: https://github.com/kmackay/micro-ecc
 */
 
 #include <ESP8266WiFi.h>
@@ -311,15 +292,15 @@ static bool doHandshake() {
 
   uint8_t header[2];
   if (!readExact(client, header, sizeof(header))) return false;
-  if (header[0] != HS_SERVER_HELLO || header[1] != VERSION) { //dati iniziali usati dall'imlpementazione, non rilevanti
+  if (header[0] != HS_SERVER_HELLO || header[1] != VERSION) { //dati iniziali usati dal protocollo, non rilevanti
     Serial.println("[HS] Bad server hello");
     return false;
   }
 //Ns= nonce server
   uint8_t Ns[32], Ps[64]; //ps[0..31] e ps[32...63] sono le coordinate XY
   // del punto della curva ellittica che rappresenta la chiave pubblica
-  if (!readExact(client, Ns, sizeof(Ns))) return false;
-  if (!readExact(client, Ps, sizeof(Ps))) return false;
+  if (!readExact(client, Ns, sizeof(Ns))) return false; //riceve chiave nonce server
+  if (!readExact(client, Ps, sizeof(Ps))) return false; //riceve chiave pubblica ECDH server
 
   const uECC_Curve curve = uECC_secp256r1(); //richiede a uECC la curva p256, sostanzialmente una struttura
   // che definisce matematicamente i punti ammissibili 
@@ -338,36 +319,39 @@ static bool doHandshake() {
 
   uint8_t transcript[1 + 1 + 32 + 64 + 32 + 64];
   size_t transcriptLen = 0;
-  buildTranscript('C', Ns, Ps, Nc, Pc, transcript, transcriptLen);
+  buildTranscript('C', Ns, Ps, Nc, Pc, transcript, transcriptLen); //il transcript mette insieme i nonce e le chiavi pubbliche 
 
   uint8_t macC[32];
-  hmacSha256(PSK, sizeof(PSK), transcript, transcriptLen, macC);
+  hmacSha256(PSK, sizeof(PSK), transcript, transcriptLen, macC); //l'hmac crea un "sigillo" crittografico in base ai dati e li mette in macC
 
   uint8_t helloPrefix[2] = {HS_CLIENT_HELLO, VERSION};
   if (!writeExact(client, helloPrefix, sizeof(helloPrefix))) return false;
-  if (!writeExact(client, Nc, sizeof(Nc))) return false;
-  if (!writeExact(client, Pc, sizeof(Pc))) return false;
-  if (!writeExact(client, macC, sizeof(macC))) return false;
+  if (!writeExact(client, Nc, sizeof(Nc))) return false; //invio nonce client
+  if (!writeExact(client, Pc, sizeof(Pc))) return false; //invio chiave pubblica ECDH client
+  if (!writeExact(client, macC, sizeof(macC))) return false; //invio mac calcolato del client, serve al server per autenticare il client
 
   uint8_t finishType;
   if (!readExact(client, &finishType, 1)) return false;
   if (finishType != HS_SERVER_FINISH) return false;
 
   uint8_t receivedMacS[32];
-  if (!readExact(client, receivedMacS, sizeof(receivedMacS))) return false;
+  if (!readExact(client, receivedMacS, sizeof(receivedMacS))) return false; //mac calcolato dal server, server al client per autenticare il server
 
-  buildTranscript('S', Ns, Ps, Nc, Pc, transcript, transcriptLen);
+  buildTranscript('S', Ns, Ps, Nc, Pc, transcript, transcriptLen); 
   uint8_t expectedMacS[32];
-  hmacSha256(PSK, sizeof(PSK), transcript, transcriptLen, expectedMacS);
+  hmacSha256(PSK, sizeof(PSK), transcript, transcriptLen, expectedMacS); //calcolo del mac previsto del server
 
-  if (!constTimeEq(receivedMacS, expectedMacS, 32)) {
+  if (!constTimeEq(receivedMacS, expectedMacS, 32)) { //verifica che il mac inviato dal server e il mac previsto dal client coincidano
+  //è un controllo a tempo costante, perchè se si ipotizza un attaccante in grado di misurare con grande precisione il tempo impiegato per il confronto potrebbe capire 
+  //in  base al tempo il primo errore che trova e ricostruire il mac pezzo per pezzo
     Serial.println("[HS] Server PSK authentication failed");
     secureWipe(privC);
     return false;
   }
 
   uint8_t sharedSecret[32];
-  if (!uECC_shared_secret(Ps, privC, sharedSecret, curve)) {
+  if (!uECC_shared_secret(Ps, privC, sharedSecret, curve)) { //viene calcolato verificato se è shared secret, ovvero combinando la chiave pubblica del server con la chiave privata del client
+  //e viceversa. questo matematicamente produce lo stesso risultato (a.k.a. chiave crittografica per i messaggi)
     Serial.println("[HS] ECDH failed");
     secureWipe(privC);
     return false;
@@ -377,27 +361,29 @@ static bool doHandshake() {
   uint8_t salt[64];
   memcpy(salt, Ns, 32);
   memcpy(salt + 32, Nc, 32);
-
+ //il salt è ns || nc. in questo caso, si poteva anche usare transcript o le chiavi pubbliche, essendo ephemeral, ma per "pulizia concettuale" meglio usare i nonce, che sono 
+ //apposta per identificare una sessione nuova ogni volta
   static const uint8_t INFO[] = "esp8266-psk-ecdh-v1";
   uint8_t material[80];
   if (!hkdfSha256(sharedSecret, sizeof(sharedSecret),
                   salt, sizeof(salt),
                   INFO, sizeof(INFO) - 1,
-                  material, sizeof(material))) {
+                  material, sizeof(material))) { //key derivation function che usa a sua volta l'hmac. un singolo hmac produce 32 byte, per arrivare a 80 viene ripetuto
+                  //l'hmac piu volte in modo "ricorsivo" aggiungendo il risultato precedente fino a ottenere i byte necessari
     secureWipe(privC);
     secureWipe(sharedSecret);
     return false;
   }
 
-  // Server -> ESP: first 40 bytes.
+//chiave e seed IV usati per la ricezione di messaggi
   memcpy(recvKey, material, 32);
   memcpy(recvIvSeed, material + 32, 8);
 
-  // ESP -> Server: next 40 bytes.
+//chiave e seed IV usati per l'invio di messaggi
   memcpy(sendKey, material + 40, 32);
   memcpy(sendIvSeed, material + 72, 8);
-
-  secureWipe(privC);
+//cancellazione dalla memoria di materiale sensibile. usa variabili volatile per impedire a eventuali ottimizzazioni del compilatore di non effettuare il wipe
+  secureWipe(privC); 
   secureWipe(sharedSecret);
   secureWipe(material);
   secureWipe(macC);
