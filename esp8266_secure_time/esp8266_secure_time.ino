@@ -1,6 +1,7 @@
 /*
 
-micro-ecc by Kenneth MacKay: https://github.com/kmackay/micro-ecc
+micro-ecc di Kenneth MacKay: https://github.com/kmackay/micro-ecc
+Crypto di Rhys weatherley https://rweather.github.io/arduinolibs/crypto.html
 */
 
 #include <ESP8266WiFi.h>
@@ -125,7 +126,7 @@ static uint16_t readU16BE(const uint8_t in[2]) {
   return ((uint16_t)in[0] << 8) | in[1];
 }
 
-static void writeU32BE(uint8_t out[4], uint32_t v) {
+static void writeU32BE(uint8_t out[4], uint32_t v) { //forza la rappresentazione dell'intero a 32 bit nel corrispettivo Big Endian. per evitare problemi di architetture diverse
   out[0] = (uint8_t)(v >> 24);
   out[1] = (uint8_t)(v >> 16);
   out[2] = (uint8_t)(v >> 8);
@@ -207,6 +208,7 @@ static bool hkdfSha256(const uint8_t *ikm, size_t ikmLen,
 static void makeIv(const uint8_t seed[8], uint32_t counter, uint8_t iv[12]) {
   memcpy(iv, seed, 8);
   writeU32BE(iv + 8, counter);
+  //i primi 8 byte arrivano da seed, mentre i restanti 4 (iv+8) vengono da counter
 }
 
 static bool gcmEncrypt(const uint8_t key[32], const uint8_t iv[12],
@@ -216,15 +218,18 @@ static bool gcmEncrypt(const uint8_t key[32], const uint8_t iv[12],
   if (plainLen > MAX_PLAINTEXT) return false;
 
   GCM<AES256> gcm;
+  //banalmente imposta key e IV per il messaggio attuale da cifrare
   if (!gcm.setKey(key, 32)) return false;
   if (!gcm.setIV(iv, 12)) return false;
 
   uint8_t aad[4];
-  writeU32BE(aad, counter);
-  gcm.addAuthData(aad, sizeof(aad));
+  writeU32BE(aad, counter); //*senza, non tutti i processori funzionano ugualmente 
+  gcm.addAuthData(aad, sizeof(aad)); //autenticato ma non cifrato: il counter è ancora visibile in rete,ma usato come parte dell'encrypt, come IPsec ESP
 
-  gcm.encrypt(cipherAndTag, plain, plainLen);
-  gcm.computeTag(cipherAndTag + plainLen, GCM_TAG_LEN);
+  gcm.encrypt(cipherAndTag, plain, plainLen); //calcolo e inserimento dei dati crittografati nel buffer
+  gcm.computeTag(cipherAndTag + plainLen, GCM_TAG_LEN); //calcolo e inserimento del tag di autenticazione nel buffer. 
+  //[serve a "verificare" l'autenticità di ogni messaggio, 
+  //e controllare che non sia stato modificato]
   outLen = plainLen + GCM_TAG_LEN;
   gcm.clear();
   return true;
@@ -350,7 +355,7 @@ static bool doHandshake() {
   }
 
   uint8_t sharedSecret[32];
-  if (!uECC_shared_secret(Ps, privC, sharedSecret, curve)) { //viene calcolato verificato se è shared secret, ovvero combinando la chiave pubblica del server con la chiave privata del client
+  if (!uECC_shared_secret(Ps, privC, sharedSecret, curve)) { //viene verificato se è shared secret, ovvero combinando la chiave pubblica del server con la chiave privata del client
   //e viceversa. questo matematicamente produce lo stesso risultato (a.k.a. chiave crittografica per i messaggi)
     Serial.println("[HS] ECDH failed");
     secureWipe(privC);
@@ -361,11 +366,11 @@ static bool doHandshake() {
   uint8_t salt[64];
   memcpy(salt, Ns, 32);
   memcpy(salt + 32, Nc, 32);
- //il salt è ns || nc. in questo caso, si poteva anche usare transcript o le chiavi pubbliche, essendo ephemeral, ma per "pulizia concettuale" meglio usare i nonce, che sono 
+ //il salt è ns || nc. in questo caso, si poteva anche usare transcript o le chiavi pubbliche, essendo effimera, ma per "pulizia concettuale" meglio usare i nonce, che sono 
  //apposta per identificare una sessione nuova ogni volta
   static const uint8_t INFO[] = "esp8266-psk-ecdh-v1";
   uint8_t material[80];
-  if (!hkdfSha256(sharedSecret, sizeof(sharedSecret),
+  if (!hkdfSha256(sharedSecret, sizeof(sharedSecret), //inserisce in material le varie chiavi calcolate da tutti i dati utilizzati
                   salt, sizeof(salt),
                   INFO, sizeof(INFO) - 1,
                   material, sizeof(material))) { //key derivation function che usa a sua volta l'hmac. un singolo hmac produce 32 byte, per arrivare a 80 viene ripetuto
@@ -375,11 +380,11 @@ static bool doHandshake() {
     return false;
   }
 
-//chiave e seed IV usati per la ricezione di messaggi
+// salva da material la chiave e seed IV usati per la ricezione di messaggi
   memcpy(recvKey, material, 32);
   memcpy(recvIvSeed, material + 32, 8);
 
-//chiave e seed IV usati per l'invio di messaggi
+//salva da material la chiave e seed IV usati per l'invio di messaggi
   memcpy(sendKey, material + 40, 32);
   memcpy(sendIvSeed, material + 72, 8);
 //cancellazione dalla memoria di materiale sensibile. usa variabili volatile per impedire a eventuali ottimizzazioni del compilatore di non effettuare il wipe
@@ -414,9 +419,9 @@ static bool sendSecureText(const String &text) {
     return false;
   }
 
-  uint32_t counter = ++sendCounter;
+  uint32_t counter = ++sendCounter; //counter usato per impedire replay attack
   uint8_t iv[12];
-  makeIv(sendIvSeed, counter, iv);
+  makeIv(sendIvSeed, counter, iv); //viene calcolato l'iv per ogni messaggio. sostanzialemnte analogo al nonce per l'autenticazione
 
   uint8_t cipher[MAX_CIPHERTEXT];
   size_t cipherLen = 0;
@@ -433,6 +438,7 @@ static bool sendSecureText(const String &text) {
 
   return writeExact(client, hdr, sizeof(hdr)) &&
          writeExact(client, cipher, cipherLen);
+         //i due write sono effettuati per separare l'header dal payload effettivo
 }
 
 static bool receiveSecureText(String &outText, uint32_t timeoutMs = 20) {

@@ -34,7 +34,9 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 HOST = "0.0.0.0"
 PORT = 1988
 
-# Must be identical to the ESP8266 PSK.
+# PSK (Pre-Shared Key): deve essere identica a quella salvata sull'ESP8266.
+# Non viene usata direttamente per cifrare i messaggi: durante l'handshake serve
+# per calcolare gli HMAC e quindi autenticare reciprocamente ESP e server.
 PSK = bytes([
     0x2A,0xF1,0x44,0x90,0x31,0xC2,0x77,0x5B,
     0x9D,0xA8,0x13,0x6E,0x54,0xB7,0xC0,0x22,
@@ -49,12 +51,14 @@ HS_CLIENT_HELLO = 0x11
 HS_SERVER_FINISH = 0x12
 FRAME_SECURE = 0x20
 
-NONCE_LEN = 32
-PUB_LEN = 64
-HMAC_LEN = 32
-GCM_TAG_LEN = 16
-MAX_CIPHERTEXT = 144
+NONCE_LEN = 32       # Ns/Nc: nonce casuali che rendono ogni handshake/sessione differente.
+PUB_LEN = 64         # chiave pubblica P-256 in formato X || Y: 32 byte X + 32 byte Y.
+HMAC_LEN = 32        # HMAC-SHA256 produce 32 byte.
+GCM_TAG_LEN = 16     # tag AES-GCM: autentica il messaggio e rileva eventuali modifiche.
+MAX_CIPHERTEXT = 144 # 128 byte massimi di plaintext + 16 byte di tag GCM.
 
+# Stringa di contesto passata a HKDF: separa logicamente queste chiavi da eventuali
+# altre chiavi che potrebbero essere derivate dallo stesso shared secret.
 INFO = b"esp8266-psk-ecdh-v1"
 
 
@@ -69,33 +73,47 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def raw_public_key(pub: ec.EllipticCurvePublicKey) -> bytes:
+    # cryptography rappresenta un punto P-256 non compresso come 0x04 || X || Y
+    # (65 byte totali). micro-ecc sull'ESP usa invece direttamente X || Y (64 byte).
     encoded = pub.public_bytes(
         serialization.Encoding.X962,
         serialization.PublicFormat.UncompressedPoint,
     )
     if len(encoded) != 65 or encoded[0] != 0x04:
         raise ValueError("unexpected P-256 encoding")
-    return encoded[1:]  # micro-ecc uses X||Y, 64 bytes
+    return encoded[1:]  # rimuove il byte 0x04 e lascia solamente X || Y
 
 
 def public_from_raw(raw: bytes) -> ec.EllipticCurvePublicKey:
     if len(raw) != 64:
         raise ValueError("P-256 public key must be 64 bytes")
+
+    # Operazione inversa di raw_public_key(): aggiunge 0x04 davanti a X || Y,
+    # così cryptography può validare il punto e ricostruire la chiave pubblica P-256.
     encoded = b"\x04" + raw
     return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), encoded)
 
 
 def transcript(role: bytes, ns: bytes, ps: bytes, nc: bytes, pc: bytes) -> bytes:
+    # Il transcript mette insieme ruolo, versione, nonce e chiavi pubbliche di entrambi.
+    # L'HMAC viene calcolato su questi dati per impedire che vengano sostituiti durante
+    # l'handshake senza che l'altra parte se ne accorga.
     return role + bytes([VERSION]) + ns + ps + nc + pc
 
 
 @dataclass
 class SecureChannel:
     sock: socket.socket
+
+    # Chiavi e seed IV separati per le due direzioni: riutilizzare la stessa coppia
+    # key/IV nelle due direzioni sarebbe una cattiva pratica con AES-GCM.
     send_key: bytes
     recv_key: bytes
     send_seed: bytes
     recv_seed: bytes
+
+    # I counter partono da zero e crescono per ogni messaggio. Servono sia a costruire
+    # IV diversi sia a rifiutare pacchetti già ricevuti (replay) o fuori ordine.
     send_counter: int = 0
     recv_counter: int = 0
 
@@ -103,7 +121,11 @@ class SecureChannel:
     def _iv(seed: bytes, counter: int) -> bytes:
         if len(seed) != 8:
             raise ValueError("bad IV seed")
-        return seed + struct.pack(">I", counter)
+
+        # IV AES-GCM di 12 byte = seed di sessione (8 byte) || counter (4 byte).
+        # Il seed resta fisso per quella direzione durante la sessione, mentre il counter
+        # cambia a ogni messaggio: in questo modo non si riutilizza lo stesso IV.
+        return seed + struct.pack(">I", counter)  # >I = uint32 in Big Endian
 
     def send_text(self, text: str) -> None:
         data = text.encode("utf-8")
@@ -113,12 +135,23 @@ class SecureChannel:
             raise RuntimeError("counter exhausted: reconnect required")
 
         self.send_counter += 1
-        counter = self.send_counter
+        counter = self.send_counter  # numero progressivo del messaggio: aiuta a impedire replay attack
+
+        # Il counter viene anche passato come AAD (Additional Authenticated Data):
+        # rimane visibile nell'header, quindi non è cifrato, ma AES-GCM lo autentica.
+        # Se qualcuno modifica il counter in rete, la verifica del tag fallisce.
         aad = struct.pack(">I", counter)
+
+        # Per ogni messaggio si costruisce un nuovo IV usando seed + counter.
         iv = self._iv(self.send_seed, counter)
 
-        # cryptography AESGCM appends the 16-byte tag to ciphertext.
+        # AESGCM.encrypt usa send_key per cifrare data con questo IV.
+        # Il risultato della libreria è: ciphertext || tag GCM da 16 byte.
+        # Il tag serve a verificare sia l'autenticità/integrità del ciphertext sia dell'AAD.
         ciphertext = AESGCM(self.send_key).encrypt(iv, data, aad)
+
+        # Header in chiaro: tipo(1) || counter(4) || lunghezza ciphertext+tag(2).
+        # Il counter è comunque protetto contro modifiche perché è stato inserito nell'AAD.
         header = struct.pack(">BIH", FRAME_SECURE, counter, len(ciphertext))
         self.sock.sendall(header + ciphertext)
 
@@ -128,30 +161,40 @@ class SecureChannel:
 
         if frame_type != FRAME_SECURE:
             raise ValueError(f"unexpected frame type 0x{frame_type:02x}")
+        # Se il counter non è maggiore dell'ultimo accettato, il pacchetto è vecchio,
+        # duplicato oppure fuori ordine: viene rifiutato prima di elaborarlo.
         if counter <= self.recv_counter:
             raise ValueError("replay/out-of-order packet rejected")
         if clen < GCM_TAG_LEN or clen > MAX_CIPHERTEXT:
             raise ValueError("invalid ciphertext length")
 
         ciphertext = recv_exact(self.sock, clen)
+
+        # Ricostruisce esattamente la stessa AAD e lo stesso IV usati dal mittente.
         aad = struct.pack(">I", counter)
         iv = self._iv(self.recv_seed, counter)
 
-        # Tag verification happens inside decrypt().
+        # decrypt() riceve ciphertext || tag. La libreria verifica internamente il tag GCM:
+        # se key, IV, ciphertext o AAD non coincidono con quelli originali, solleva errore
+        # e il plaintext non viene considerato autentico.
         plaintext = AESGCM(self.recv_key).decrypt(iv, ciphertext, aad)
 
-        # Only advance after successful authentication.
+        # Il counter viene aggiornato solo DOPO una verifica GCM riuscita, altrimenti un
+        # pacchetto falso con counter alto potrebbe far scartare i messaggi validi successivi.
         self.recv_counter = counter
         return plaintext.decode("utf-8")
 
 
 def server_handshake(sock: socket.socket) -> SecureChannel:
-    # Ephemeral server ECDH key.
+    # Genera una nuova coppia ECDH P-256 effimera per questa singola sessione.
+    # "Effimera" significa che a una nuova connessione verrà generata una nuova chiave privata.
     server_priv = ec.generate_private_key(ec.SECP256R1())
-    ps = raw_public_key(server_priv.public_key())
+    ps = raw_public_key(server_priv.public_key())  # Ps = chiave pubblica ECDH del server
+
+    # Ns = nonce casuale del server. Non è segreto: serve a rendere ogni handshake unico.
     ns = __import__("os").urandom(NONCE_LEN)
 
-    # 1) SERVER_HELLO
+    # 1) SERVER_HELLO: invia versione, nonce server e chiave pubblica ECDH del server.
     sock.sendall(bytes([HS_SERVER_HELLO, VERSION]) + ns + ps)
 
     # 2) CLIENT_HELLO
@@ -159,34 +202,45 @@ def server_handshake(sock: socket.socket) -> SecureChannel:
     if prefix != bytes([HS_CLIENT_HELLO, VERSION]):
         raise ValueError("bad client hello")
 
-    nc = recv_exact(sock, NONCE_LEN)
-    pc = recv_exact(sock, PUB_LEN)
-    mac_c = recv_exact(sock, HMAC_LEN)
+    nc = recv_exact(sock, NONCE_LEN)  # Nc = nonce casuale generato dall'ESP/client
+    pc = recv_exact(sock, PUB_LEN)    # Pc = chiave pubblica ECDH effimera dell'ESP/client
+    mac_c = recv_exact(sock, HMAC_LEN)  # HMAC inviato dall'ESP per autenticarsi
 
+    # Ricalcola localmente il MAC che il client avrebbe dovuto produrre conoscendo la PSK.
+    # Il ruolo "C" distingue questo MAC da quello del server anche se il resto del transcript
+    # è identico. In questo modo nonce e chiavi pubbliche sono tutti legati all'autenticazione.
     expected_c = hmac.new(
         PSK,
         transcript(b"C", ns, ps, nc, pc),
         hashlib.sha256,
     ).digest()
 
+    # compare_digest effettua un confronto pensato per evitare differenze di tempo evidenti
+    # tra MAC che differiscono presto o tardi, riducendo il rischio di timing attack.
     if not hmac.compare_digest(mac_c, expected_c):
         raise PermissionError("client PSK authentication failed")
 
-    # Validate/parse client point before ECDH.
+    # Ricostruisce e valida Pc come punto della curva P-256 prima di usarlo nell'ECDH.
     client_pub = public_from_raw(pc)
 
-    # 3) SERVER_FINISH authenticates server to ESP and binds same transcript.
+    # 3) SERVER_FINISH: ora è il server ad autenticarsi verso l'ESP.
     mac_s = hmac.new(
         PSK,
         transcript(b"S", ns, ps, nc, pc),
         hashlib.sha256,
     ).digest()
+    # L'ESP conosce la stessa PSK e può ricalcolare mac_s: se coincide, autentica il server.
     sock.sendall(bytes([HS_SERVER_FINISH]) + mac_s)
 
-    # ECDH shared secret.
+    # ECDH combina la chiave PRIVATA del server con la chiave PUBBLICA del client.
+    # Sul lato ESP avviene l'operazione opposta (privata client + pubblica server) e, per
+    # le proprietà matematiche dell'ECDH, entrambi ottengono lo stesso shared secret.
     shared = server_priv.exchange(ec.ECDH(), client_pub)
 
-    # Independent traffic keys, bound to both fresh nonces.
+    # Lo shared secret ECDH non viene usato direttamente come chiave AES. HKDF-SHA256
+    # lo trasforma in 80 byte di materiale crittografico adatto all'uso.
+    # salt = Ns || Nc lega la derivazione a questa specifica sessione/handshake.
+    # info identifica il protocollo e il contesto in cui le chiavi verranno usate.
     material = HKDF(
         algorithm=hashes.SHA256(),
         length=80,
@@ -194,11 +248,14 @@ def server_handshake(sock: socket.socket) -> SecureChannel:
         info=INFO,
     ).derive(shared)
 
-    # Server -> ESP
+    # I primi 40 byte sono dedicati alla direzione Server -> ESP:
+    # 32 byte di chiave AES-256 + 8 byte di seed usato per costruire gli IV.
     send_key = material[0:32]
     send_seed = material[32:40]
 
-    # ESP -> Server
+    # I successivi 40 byte sono dedicati alla direzione ESP -> Server.
+    # Sul codice ESP questi stessi blocchi sono naturalmente chiamati recvKey/recvIvSeed
+    # e sendKey/sendIvSeed con verso opposto rispetto al server.
     recv_key = material[40:72]
     recv_seed = material[72:80]
 
