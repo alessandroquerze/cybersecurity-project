@@ -22,7 +22,7 @@ extern "C" {
 const char *WIFI_SSID     = "FP5";
 //const char *WIFI_PASSWORD = "CHANGE_ME"; rimossa
 
-IPAddress SERVER_IP(10, 83, 168, 17);
+IPAddress SERVER_IP(10, 58, 80, 17);
 const uint16_t SERVER_PORT = 1988;
 
 // Exactly 32 bytes. Replace with a random value and copy the same bytes to pc_server.py.

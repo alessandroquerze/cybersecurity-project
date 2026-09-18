@@ -74,6 +74,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 def raw_public_key(pub: ec.EllipticCurvePublicKey) -> bytes:
     # cryptography rappresenta un punto P-256 non compresso come 0x04 || X || Y
+    #in sostanza 0x04 e' l'header del punto
     # (65 byte totali). micro-ecc sull'ESP usa invece direttamente X || Y (64 byte).
     encoded = pub.public_bytes(
         serialization.Encoding.X962,
@@ -193,7 +194,7 @@ def server_handshake(sock: socket.socket) -> SecureChannel:
 
     # Ns = nonce casuale del server. Non è segreto: serve a rendere ogni handshake unico.
     ns = __import__("os").urandom(NONCE_LEN)
-
+    #in questo caso non e' TRNG ma CSPRNG
     # 1) SERVER_HELLO: invia versione, nonce server e chiave pubblica ECDH del server.
     sock.sendall(bytes([HS_SERVER_HELLO, VERSION]) + ns + ps)
 
